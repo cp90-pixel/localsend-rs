@@ -182,6 +182,10 @@ impl Server {
 
                 Ok(Json(wanted_files))
             }
+            Some(ClientMessage::SendFiles(_)) => {
+                // This should not happen in this context
+                Err((StatusCode::BAD_REQUEST, "Invalid client message".into()))
+            }
         }
     }
 

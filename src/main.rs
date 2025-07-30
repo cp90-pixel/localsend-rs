@@ -1,13 +1,13 @@
-use std::{collections::HashMap, fmt::Write, io, net::Ipv4Addr, time::Duration};
+use std::{collections::HashMap, fmt::Write, io, net::Ipv4Addr, path::PathBuf, time::Duration};
 
 use console::style;
-use dialoguer::{theme::ColorfulTheme, MultiSelect};
+use dialoguer::{theme::ColorfulTheme, Input, MultiSelect, Select};
 use indicatif::{MultiProgress, ProgressBar, ProgressState, ProgressStyle};
 use tokio::{runtime, sync::mpsc};
 use tracing::{debug, info};
 use tracing_subscriber::{filter::EnvFilter, FmtSubscriber};
 
-use localsend_core::{ClientMessage, DeviceScanner, FileInfo, Server, ServerMessage};
+use localsend_core::{Client, ClientMessage, DeviceInfo, DeviceScanner, FileInfo, Server, ServerMessage};
 
 const ALIAS: &str = "rustsend";
 const INTERFACE_ADDR: Ipv4Addr = Ipv4Addr::new(0, 0, 0, 0);
@@ -22,7 +22,7 @@ struct State {
 
 fn main() {
     console_subscriber::init();
-    // init_tracing_logger();
+    init_tracing_logger();
     // TODO: should i use new_current_thread or new_multi_thread?
     let runtime = runtime::Builder::new_current_thread()
         .enable_all()
@@ -160,7 +160,84 @@ async fn start_device_scanner() {
 }
 
 async fn async_main() -> Result<(), io::Error> {
-    // spawn task to listen and announce multicast messages
+    // Ask user if they want to send or receive files
+    let options = vec!["Send Files", "Receive Files"];
+    let selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("What would you like to do?")
+        .items(&options)
+        .default(0)
+        .interact()
+        .unwrap();
+
+    match selection {
+        0 => send_files().await?,
+        1 => receive_files().await?,
+        _ => unreachable!(),
+    }
+
+    Ok(())
+}
+
+async fn send_files() -> Result<(), io::Error> {
+    // Start device scanner to discover devices
+    let _device_scanner_handle = tokio::spawn(start_device_scanner());
+    
+    // Wait a bit for devices to be discovered
+    println!("Scanning for devices...");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    
+    // Get list of file paths to send
+    let file_paths = get_file_paths();
+    if file_paths.is_empty() {
+        println!("No files selected. Exiting.");
+        return Ok(());
+    }
+    
+    // Create a device info for this device
+    let device_info = DeviceInfo {
+        alias: ALIAS.to_string(),
+        device_type: "desktop".to_string(),
+        device_model: Some("linux".to_string()),
+        ip: "0.0.0.0".to_string(), // Will be set by receiver
+        port: MULTICAST_PORT,
+    };
+    
+    // Create client
+    let client = Client::new(device_info);
+    
+    // TODO: Get discovered devices and let user select one
+    // For now, manually input the IP and port
+    let target_ip = Input::<String>::with_theme(&ColorfulTheme::default())
+        .with_prompt("Enter target device IP")
+        .interact()
+        .unwrap();
+    
+    let target_port = Input::<u16>::with_theme(&ColorfulTheme::default())
+        .with_prompt("Enter target device port")
+        .default(MULTICAST_PORT)
+        .interact()
+        .unwrap();
+    
+    let target_device = DeviceInfo {
+        alias: "Target".to_string(),
+        device_type: "unknown".to_string(),
+        device_model: None,
+        ip: target_ip,
+        port: target_port,
+    };
+    
+    // Send files
+    println!("Sending files to {}:{}...", target_device.ip, target_device.port);
+    match client.send_files(&target_device, file_paths.iter().map(PathBuf::as_path).collect()).await {
+        Ok(_) => println!("Files sent successfully!"),
+        Err(e) => println!("Error sending files: {}", e),
+    }
+    
+    Ok(())
+}
+
+async fn receive_files() -> Result<(), io::Error> {
+    // spawn task to listen and announce multicast
     tokio::spawn(start_device_scanner());
 
     let (server_tx, server_rx) = mpsc::unbounded_channel();
@@ -171,6 +248,34 @@ async fn async_main() -> Result<(), io::Error> {
     let server = Server::new(INTERFACE_ADDR, MULTICAST_PORT);
     server.start_server(server_tx, client_rx).await;
     Ok(())
+}
+
+fn get_file_paths() -> Vec<PathBuf> {
+    // For now, manually input file paths
+    let mut file_paths = Vec::new();
+    
+    loop {
+        let file_path = Input::<String>::with_theme(&ColorfulTheme::default())
+            .with_prompt("Enter file path (or leave empty to finish)")
+            .allow_empty(true)
+            .interact()
+            .unwrap();
+        
+        if file_path.is_empty() {
+            break;
+        }
+        
+        let path = PathBuf::from(file_path);
+        if !path.exists() {
+            println!("File does not exist: {}", path.display());
+            continue;
+        }
+        
+        println!("Added file: {}", path.display());
+        file_paths.push(path);
+    }
+    
+    file_paths
 }
 
 fn init_tracing_logger() {

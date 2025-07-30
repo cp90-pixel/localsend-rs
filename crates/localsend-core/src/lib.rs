@@ -1,11 +1,13 @@
 pub mod device_scanner;
 pub mod protos;
 pub mod server;
+pub mod client;
 mod utils;
 
 pub use device_scanner::*;
 pub use protos::*;
 pub use server::*;
+pub use client::*;
 
 const BUFFER_SIZE: u16 = 2048;
 

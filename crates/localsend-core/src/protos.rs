@@ -33,6 +33,7 @@ pub enum ReceiveStatus {
 pub enum ClientMessage {
     Allow(Vec<String>),
     Decline,
+    SendFiles(HashMap<String, FileInfo>),
 }
 
 #[derive(Clone, Debug)]

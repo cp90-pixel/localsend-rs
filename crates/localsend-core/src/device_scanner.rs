@@ -69,10 +69,9 @@ impl DeviceScanner {
         addr: (Ipv4Addr, u16),
     ) {
         // TODO(notjedi): any other way to not accept addr as argument
-        send_socket
-            .send_to(announcement_msg.as_bytes(), addr)
-            .await
-            .unwrap();
+        if let Err(e) = send_socket.send_to(announcement_msg.as_bytes(), addr).await {
+            debug!("Failed to send announcement: {}", e);
+        }
     }
 
     pub async fn announce_repeat(
@@ -91,9 +90,11 @@ impl DeviceScanner {
 
     pub async fn listen_and_announce_multicast(&mut self) {
         // https://gist.github.com/pusateri/df98511b88e9000f388d344a1f3db9e7
-        self.socket
-            .join_multicast_v4(self.multicast_addr, self.interface_addr)
-            .expect("failed to join multicast");
+        // Try to join multicast group, but don't panic if it fails
+        if let Err(e) = self.socket.join_multicast_v4(self.multicast_addr, self.interface_addr) {
+            debug!("Failed to join multicast group: {}", e);
+            // Continue anyway, as we can still send files directly
+        }
 
         self.this_device.announcement = true;
         let send_socket = self.socket.clone();
@@ -109,31 +110,43 @@ impl DeviceScanner {
 
         let mut buf = [0u8; BUFFER_SIZE as usize];
         loop {
-            if let Ok((amt, src)) = self.socket.recv_from(&mut buf).await {
-                let mut device_response: DeviceResponse =
-                    serde_json::from_slice(&buf[..amt]).unwrap();
-                (
-                    device_response.device_info.ip,
-                    device_response.device_info.port,
-                ) = (src.ip().to_string(), src.port());
+            match self.socket.recv_from(&mut buf).await {
+                Ok((amt, src)) => {
+                    match serde_json::from_slice::<DeviceResponse>(&buf[..amt]) {
+                        Ok(mut device_response) => {
+                            (
+                                device_response.device_info.ip,
+                                device_response.device_info.port,
+                            ) = (src.ip().to_string(), src.port());
 
-                if device_response == self.this_device {
-                    continue;
-                }
+                            if device_response == self.this_device {
+                                continue;
+                            }
 
-                if device_response.announcement {
-                    Self::announce(
-                        &self.socket,
-                        reply_announce_msg.as_str(),
-                        (self.multicast_addr, self.multicast_port),
-                    )
-                    .await;
-                }
+                            if device_response.announcement {
+                                Self::announce(
+                                    &self.socket,
+                                    reply_announce_msg.as_str(),
+                                    (self.multicast_addr, self.multicast_port),
+                                )
+                                .await;
+                            }
 
-                if !self.devices.contains(&device_response.device_info) {
-                    self.devices.push(device_response.device_info);
-                    debug!("{:#?}", &self.devices);
-                    debug!("{:#?}", &self.devices.len());
+                            if !self.devices.contains(&device_response.device_info) {
+                                self.devices.push(device_response.device_info);
+                                debug!("{:#?}", &self.devices);
+                                debug!("{:#?}", &self.devices.len());
+                            }
+                        },
+                        Err(e) => {
+                            debug!("Failed to parse device response: {}", e);
+                        }
+                    }
+                },
+                Err(e) => {
+                    debug!("Failed to receive from socket: {}", e);
+                    // Sleep a bit to avoid busy-waiting in case of persistent errors
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
         }
