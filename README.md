@@ -22,4 +22,4 @@ a small todo: `use mem::take` when ever possible, to avoid clones.
 - [x] pass config from bin to lib
 - [ ] config file for device name, default port, etc
 - [ ] Support protocol `v2`
-- [ ] fix `Illegal SNI hostname received` from dart side
+- [x] fix `Illegal SNI hostname received` from dart side
