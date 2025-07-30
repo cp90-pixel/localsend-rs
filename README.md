@@ -16,7 +16,7 @@ a small todo: `use mem::take` when ever possible, to avoid clones.
 ## Roadmap
 
 - [x] receive files
-- [ ] send files
+- [x] send files
 - [ ] handle connection reset errors and cancel requests when sending and receiving files
 - [ ] progress for sending files
 - [x] pass config from bin to lib

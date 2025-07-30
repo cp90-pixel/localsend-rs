@@ -22,7 +22,7 @@ struct State {
 
 fn main() {
     console_subscriber::init();
-    init_tracing_logger();
+    // init_tracing_logger(); // Removed to avoid setting global default trace dispatcher twice
     // TODO: should i use new_current_thread or new_multi_thread?
     let runtime = runtime::Builder::new_current_thread()
         .enable_all()
@@ -278,6 +278,7 @@ fn get_file_paths() -> Vec<PathBuf> {
     file_paths
 }
 
+#[allow(dead_code)]
 fn init_tracing_logger() {
     let mut subscriber_builder = FmtSubscriber::builder()
         .with_env_filter(
