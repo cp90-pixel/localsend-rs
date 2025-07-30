@@ -22,11 +22,11 @@ pub enum FileType {
 
 #[derive(Clone, PartialEq, Debug)]
 pub enum ReceiveStatus {
-    // TODO: add status for cancelled
     Waiting,            // waiting for sender to send the files
     Receiving,          // in an ongoing session, receiving files
     Finished,           // all files received (end of session)
     FinishedWithErrors, // finished but some files could not be received (end of session)
+    Cancelled,          // session was cancelled
 }
 
 #[derive(Clone, Debug)]

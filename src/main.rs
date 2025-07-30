@@ -226,11 +226,38 @@ async fn send_files() -> Result<(), io::Error> {
         port: target_port,
     };
     
-    // Send files
+    // Send files with cancellation support
     println!("Sending files to {}:{}...", target_device.ip, target_device.port);
+    println!("Press Ctrl+C to cancel the transfer");
+    
+    let client_clone = client.clone();
+    
+    // Set up Ctrl+C handler for cancellation
+    let cancel_handle = tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+        println!("\nCancelling file transfer...");
+        client_clone.cancel();
+    });
+    
     match client.send_files(&target_device, file_paths.iter().map(PathBuf::as_path).collect()).await {
-        Ok(_) => println!("Files sent successfully!"),
-        Err(e) => println!("Error sending files: {}", e),
+        Ok(_) => {
+            println!("Files sent successfully!");
+            cancel_handle.abort(); // Cancel the Ctrl+C handler
+        },
+        Err(e) => {
+            if client.is_cancelled() {
+                println!("File transfer was cancelled by user");
+            } else if e.contains("connection reset") || e.contains("network") {
+                println!("Network error occurred: {}", e);
+                println!("This could be due to:");
+                println!("  - Network connectivity issues");
+                println!("  - Target device went offline");
+                println!("  - Firewall blocking the connection");
+            } else {
+                println!("Error sending files: {}", e);
+            }
+            cancel_handle.abort();
+        },
     }
     
     Ok(())

@@ -4,7 +4,8 @@ use std::{
     io::BufReader,
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, atomic::{AtomicBool, Ordering}},
+    time::Duration,
 };
 
 use axum::{
@@ -22,9 +23,10 @@ use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncWriteExt, BufWriter},
     sync::Mutex,
+    time::timeout,
 };
 use tokio_util::io::StreamReader;
-use tracing::{info, trace};
+use tracing::{info, trace, warn, error};
 use uuid::Uuid;
 
 use crate::{
@@ -36,6 +38,7 @@ pub struct Server {
     certificate: rcgen::Certificate,
     interface_addr: Ipv4Addr,
     multicast_port: u16,
+    is_cancelled: Arc<AtomicBool>,
 }
 
 impl Server {
@@ -44,7 +47,16 @@ impl Server {
             certificate: utils::generate_tls_cert(),
             interface_addr,
             multicast_port,
+            is_cancelled: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn cancel(&self) {
+        self.is_cancelled.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.is_cancelled.load(Ordering::Relaxed)
     }
 
     pub async fn start_server(
@@ -130,12 +142,23 @@ impl Server {
             ));
         }
 
-        // TODO(notjedi): check if cancel request is valid by comparing the ip address
-        // TODO(notjedi): set session_state.receive_session to None
-        // TODO(notjedi): clear buffer of sender_tx
+        info!("Cancelling receive session");
+        
+        // Set session status to cancelled
+        if let Some(ref mut receive_session) = session.receive_session {
+            receive_session.status = ReceiveStatus::Cancelled;
+            
+            // Mark all pending files as cancelled
+            for (_, status) in receive_session.file_status.iter_mut() {
+                if *status == ReceiveStatus::Waiting || *status == ReceiveStatus::Receiving {
+                    *status = ReceiveStatus::Cancelled;
+                }
+            }
+        }
+        
         let _ = session.server_tx.send(ServerMessage::CancelSession);
-
         session.receive_session = None;
+        
         Ok(())
     }
 
@@ -233,7 +256,7 @@ impl Server {
             (file_id, path, session.server_tx.clone())
         };
 
-        let result = stream_to_file(path, file_stream, file_id.clone(), sender).await;
+        let result = stream_to_file_with_cancellation(path, file_stream, file_id.clone(), sender).await;
 
         let mut session = session_state.lock().await;
         if session.receive_session.is_none() {
@@ -272,7 +295,7 @@ impl Server {
 }
 
 // taken and modified from: https://github.com/tokio-rs/axum/blob/main/examples/stream-to-file/src/main.rs
-async fn stream_to_file<S, E>(
+async fn stream_to_file_with_cancellation<S, E>(
     path: PathBuf,
     stream: S,
     file_id: String,
@@ -282,35 +305,108 @@ where
     S: Stream<Item = Result<Bytes, E>>,
     E: Into<BoxError>, // BoxError is just - Box<dyn std::error::Error + Send + Sync>
 {
-    let body_with_io_error = stream.map_err(|err| io::Error::new(io::ErrorKind::Other, err));
+    let body_with_io_error = stream.map_err(|err| {
+        let error_msg = err.into().to_string();
+        if is_connection_reset_error(&error_msg) {
+            warn!("Connection reset detected while receiving file: {}", error_msg);
+            io::Error::new(io::ErrorKind::ConnectionReset, error_msg)
+        } else {
+            io::Error::new(io::ErrorKind::Other, error_msg)
+        }
+    });
     let body_reader = StreamReader::new(body_with_io_error);
     futures::pin_mut!(body_reader);
 
-    let file = File::create(path).await?;
+    let file = File::create(&path).await.map_err(|e| {
+        error!("Failed to create file {}: {}", path.display(), e);
+        e
+    })?;
     let mut file_buf = BufWriter::with_capacity(16384, file);
 
-    // read 1024 * 16 bytes on each read call
-    // can i directly write to the file buffer? rn we are copying data to a buf and writing that to the file
     let mut buf = [0u8; 16384];
+    let mut total_bytes = 0;
+    let mut consecutive_errors = 0;
+    const MAX_CONSECUTIVE_ERRORS: u32 = 5;
+    
     loop {
-        match body_reader.read(&mut buf[..]).await {
-            Ok(0) => {
+        // Add timeout to read operations to detect stalled connections
+        let read_result = timeout(
+            Duration::from_secs(30),
+            body_reader.read(&mut buf[..])
+        ).await;
+
+        match read_result {
+            Ok(Ok(0)) => {
+                // End of stream
+                info!("Successfully received {} bytes for file: {}", total_bytes, path.display());
                 break;
             }
-            Ok(len) => {
-                // TODO: assert len(read) == len(written)
-                // TODO: don't unwrap
-                // TODO: no clones
-                let _ = file_buf.write(&buf[0..len]).await.unwrap();
-                let _ = sender.send(ServerMessage::SendFileRequest((file_id.clone(), len)));
+            Ok(Ok(len)) => {
+                consecutive_errors = 0; // Reset error counter on successful read
+                
+                match file_buf.write(&buf[0..len]).await {
+                    Ok(_) => {
+                        total_bytes += len;
+                        let _ = sender.send(ServerMessage::SendFileRequest((file_id.clone(), len)));
+                    }
+                    Err(e) => {
+                        error!("Failed to write to file {}: {}", path.display(), e);
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                consecutive_errors += 1;
+                let error_msg = e.to_string();
+                
+                if e.kind() == io::ErrorKind::ConnectionReset || is_connection_reset_error(&error_msg) {
+                    warn!("Connection reset while receiving file {}: {}", path.display(), error_msg);
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        format!("Connection reset after {} bytes: {}", total_bytes, error_msg)
+                    ));
+                }
+                
+                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                    error!("Too many consecutive errors ({}) while receiving file {}: {}", 
+                           consecutive_errors, path.display(), error_msg);
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("Too many consecutive errors: {}", error_msg)
+                    ));
+                }
+                
+                warn!("Read error {} (attempt {}) for file {}: {}", 
+                      consecutive_errors, consecutive_errors, path.display(), error_msg);
+                
+                // Brief delay before retrying
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
             Err(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "Failed to read from stream",
+                // Timeout occurred
+                warn!("Read timeout while receiving file: {}", path.display());
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("Read timeout after {} bytes", total_bytes)
                 ));
             }
         }
     }
+    
+    // Ensure all data is flushed to disk
+    if let Err(e) = file_buf.flush().await {
+        error!("Failed to flush file buffer for {}: {}", path.display(), e);
+        return Err(e);
+    }
+    
     Ok(())
+}
+
+fn is_connection_reset_error(error_msg: &str) -> bool {
+    let error_lower = error_msg.to_lowercase();
+    error_lower.contains("connection reset") ||
+    error_lower.contains("broken pipe") ||
+    error_lower.contains("connection aborted") ||
+    error_lower.contains("network unreachable") ||
+    error_lower.contains("connection refused")
 }

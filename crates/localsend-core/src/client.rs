@@ -1,28 +1,41 @@
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::Path, time::Duration, sync::{Arc, atomic::{AtomicBool, Ordering}}};
 
 use reqwest::{Client as ReqwestClient, ClientBuilder, StatusCode};
-use tokio::fs;
-use tracing::{debug, info};
+use tokio::{fs, time::timeout};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{DeviceInfo, FileInfo, FileType};
 
+#[derive(Clone)]
 pub struct Client {
     http_client: ReqwestClient,
     device_info: DeviceInfo,
+    is_cancelled: Arc<AtomicBool>,
 }
 
 impl Client {
     pub fn new(device_info: DeviceInfo) -> Self {
         let http_client = ClientBuilder::new()
             .danger_accept_invalid_certs(true)
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
             .build()
             .unwrap();
 
         Self {
             http_client,
             device_info,
+            is_cancelled: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn cancel(&self) {
+        self.is_cancelled.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.is_cancelled.load(Ordering::Relaxed)
     }
 
     pub async fn send_files(
@@ -30,10 +43,18 @@ impl Client {
         target_device: &DeviceInfo,
         file_paths: Vec<&Path>,
     ) -> Result<(), String> {
+        if self.is_cancelled() {
+            return Err("Operation was cancelled".to_string());
+        }
+
         // Prepare file info for each file
         let mut files = HashMap::new();
         
         for path in &file_paths {
+            if self.is_cancelled() {
+                return Err("Operation was cancelled".to_string());
+            }
+
             if !path.exists() {
                 return Err(format!("File not found: {}", path.display()));
             }
@@ -79,27 +100,17 @@ impl Client {
         
         debug!("Sending request: {:?}", send_request);
         
-        let response = self.http_client
-            .post(&target_addr)
-            .json(&send_request)
-            .send()
-            .await
-            .map_err(|e| format!("Failed to send request: {}", e))?;
-        
-        let status = response.status();
-        if status != StatusCode::OK {
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(format!("Request failed with status {}: {}", status, error_text));
-        }
-        
-        // Parse response to get file tokens
-        let tokens: HashMap<String, String> = response.json().await
-            .map_err(|e| format!("Failed to parse response: {}", e))?;
+        // Send initial request with retry logic for connection errors
+        let tokens = self.send_request_with_retry(&target_addr, &send_request, 3).await?;
         
         debug!("Received tokens: {:?}", tokens);
         
         // Send each file
         for (idx, (file_id, token)) in tokens.iter().enumerate() {
+            if self.is_cancelled() {
+                return Err("Operation was cancelled".to_string());
+            }
+
             let path = &file_paths[idx];
             let file_url = format!(
                 "https://{}:{}/api/localsend/v1/send?fileId={}&token={}",
@@ -112,24 +123,154 @@ impl Client {
             let file_content = fs::read(path).await
                 .map_err(|e| format!("Failed to read file {}: {}", path.display(), e))?;
             
-            // Send file
-            let response = self.http_client
-                .post(&file_url)
-                .body(file_content)
-                .send()
-                .await
-                .map_err(|e| format!("Failed to send file {}: {}", path.display(), e))?;
-            
-            let status = response.status();
-            if status != StatusCode::OK {
-                let error_text = response.text().await.unwrap_or_default();
-                return Err(format!("File transfer failed with status {}: {}", status, error_text));
-            }
+            // Send file with retry logic for connection errors
+            self.send_file_with_retry(&file_url, file_content, path, 3).await?;
             
             info!("Successfully sent file: {}", path.display());
         }
         
         Ok(())
+    }
+
+    async fn send_request_with_retry(
+        &self,
+        url: &str,
+        request_body: &serde_json::Value,
+        max_retries: u32,
+    ) -> Result<HashMap<String, String>, String> {
+        let mut last_error = String::new();
+        
+        for attempt in 0..=max_retries {
+            if self.is_cancelled() {
+                return Err("Operation was cancelled".to_string());
+            }
+
+            let result = timeout(
+                Duration::from_secs(30),
+                self.http_client
+                    .post(url)
+                    .json(request_body)
+                    .send()
+            ).await;
+
+            match result {
+                Ok(Ok(response)) => {
+                    let status = response.status();
+                    if status == StatusCode::OK {
+                        match response.json::<HashMap<String, String>>().await {
+                            Ok(tokens) => return Ok(tokens),
+                            Err(e) => {
+                                last_error = format!("Failed to parse response: {}", e);
+                                if attempt == max_retries {
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        let error_text = response.text().await.unwrap_or_default();
+                        last_error = format!("Request failed with status {}: {}", status, error_text);
+                        if attempt == max_retries {
+                            break;
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    last_error = format!("Network error: {}", e);
+                    if self.is_connection_error(&e) && attempt < max_retries {
+                        warn!("Connection error on attempt {}, retrying...: {}", attempt + 1, e);
+                        tokio::time::sleep(Duration::from_millis(1000 * (attempt + 1) as u64)).await;
+                        continue;
+                    }
+                    if attempt == max_retries {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    last_error = "Request timed out".to_string();
+                    if attempt == max_retries {
+                        break;
+                    }
+                }
+            }
+            
+            if attempt < max_retries {
+                tokio::time::sleep(Duration::from_millis(500 * (attempt + 1) as u64)).await;
+            }
+        }
+        
+        Err(format!("Failed after {} retries: {}", max_retries, last_error))
+    }
+
+    async fn send_file_with_retry(
+        &self,
+        url: &str,
+        file_content: Vec<u8>,
+        path: &Path,
+        max_retries: u32,
+    ) -> Result<(), String> {
+        let mut last_error = String::new();
+        
+        for attempt in 0..=max_retries {
+            if self.is_cancelled() {
+                return Err("Operation was cancelled".to_string());
+            }
+
+            let result = timeout(
+                Duration::from_secs(60), // Longer timeout for file uploads
+                self.http_client
+                    .post(url)
+                    .body(file_content.clone())
+                    .send()
+            ).await;
+
+            match result {
+                Ok(Ok(response)) => {
+                    let status = response.status();
+                    if status == StatusCode::OK {
+                        return Ok(());
+                    } else {
+                        let error_text = response.text().await.unwrap_or_default();
+                        last_error = format!("File transfer failed with status {}: {}", status, error_text);
+                        if attempt == max_retries {
+                            break;
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    last_error = format!("Network error sending file {}: {}", path.display(), e);
+                    if self.is_connection_error(&e) && attempt < max_retries {
+                        warn!("Connection error on attempt {} for file {}, retrying...: {}", 
+                              attempt + 1, path.display(), e);
+                        tokio::time::sleep(Duration::from_millis(2000 * (attempt + 1) as u64)).await;
+                        continue;
+                    }
+                    if attempt == max_retries {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    last_error = format!("File transfer timed out for {}", path.display());
+                    if attempt == max_retries {
+                        break;
+                    }
+                }
+            }
+            
+            if attempt < max_retries {
+                tokio::time::sleep(Duration::from_millis(1000 * (attempt + 1) as u64)).await;
+            }
+        }
+        
+        Err(format!("Failed to send file {} after {} retries: {}", path.display(), max_retries, last_error))
+    }
+
+    fn is_connection_error(&self, error: &reqwest::Error) -> bool {
+        error.is_connect() || 
+        error.is_timeout() ||
+        error.to_string().contains("connection reset") ||
+        error.to_string().contains("broken pipe") ||
+        error.to_string().contains("connection aborted") ||
+        error.to_string().contains("network unreachable")
     }
     
     pub async fn cancel_session(&self, target_device: &DeviceInfo) -> Result<(), String> {
