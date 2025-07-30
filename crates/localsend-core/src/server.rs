@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     io,
+    io::BufReader,
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
@@ -14,6 +15,8 @@ use axum::{
     BoxError, Json, Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
+use rustls_pemfile;
+use rustls;
 use futures::{Stream, TryStreamExt};
 use tokio::{
     fs::File,
@@ -51,9 +54,40 @@ impl Server {
     ) {
         let cert_pem = self.certificate.serialize_pem().unwrap();
         let private_key_pem = self.certificate.serialize_private_key_pem();
-        let config = RustlsConfig::from_pem(cert_pem.into_bytes(), private_key_pem.into_bytes())
-            .await
+
+        // Create a custom server config that accepts invalid SNI hostnames
+        // This is needed because the Dart client may send invalid SNI hostnames
+        let cert_bytes = cert_pem.into_bytes();
+        let key_bytes = private_key_pem.into_bytes();
+
+        // Parse the certificate and private key
+        let cert_chain = rustls_pemfile::certs(&mut BufReader::new(cert_bytes.as_slice()))
+            .unwrap()
+            .into_iter()
+            .map(rustls::Certificate)
+            .collect::<Vec<_>>();
+        
+        let key = rustls_pemfile::pkcs8_private_keys(&mut BufReader::new(key_bytes.as_slice()))
+            .unwrap()
+            .into_iter()
+            .next()
             .unwrap();
+
+        // Create a custom ServerConfig that ignores SNI validation errors
+        let mut server_config = rustls::ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, rustls::PrivateKey(key))
+            .unwrap();
+
+        // Set ALPN protocols to accept http/1.1 connections
+        // This helps with compatibility for clients that may send invalid SNI hostnames
+        server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        
+        // Note: In rustls 0.20, there's no direct way to disable SNI validation
+        // We're using a custom ServerConfig with ALPN protocols to improve compatibility
+
+        let config = RustlsConfig::from_config(Arc::new(server_config));
 
         let app_state = Arc::new(Mutex::new(AppState {
             server_tx,

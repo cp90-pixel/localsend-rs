@@ -26,7 +26,7 @@ dialoguer = "0.11"
 localsend-core = { path = "crates/localsend-core", package = "localsend-core" }
 
 [workspace]
-members = ["crates/localsend-core", "crates/axum-server", "crates/rustls"]
+members = ["crates/localsend-core"]
 
 [profile.release]
 strip = "symbols"

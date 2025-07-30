@@ -25,7 +25,9 @@ futures = "0.3"
 
 axum-macros = "0.3"
 axum = { version = "0.6", features = ["query"] }
-axum-server = { path = "../axum-server", package = "axum-server", features = [
-    "tls-rustls",
-] }
-# axum-server = { version = "0.4", features = ["tls-rustls"] }
+# axum-server = { path = "../axum-server", package = "axum-server", features = [
+#     "tls-rustls",
+# ] }
+axum-server = { version = "0.4", features = ["tls-rustls"] }
+rustls = "0.20"
+rustls-pemfile = "1.0"
