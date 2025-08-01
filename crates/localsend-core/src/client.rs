@@ -1,17 +1,74 @@
 use std::{collections::HashMap, path::Path, time::Duration, sync::{Arc, atomic::{AtomicBool, Ordering}}};
 
 use reqwest::{Client as ReqwestClient, ClientBuilder, StatusCode};
+use tokio_util::io::ReaderStream;
 use tokio::{fs, time::timeout};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{DeviceInfo, FileInfo, FileType};
 
+/// Callback trait for tracking file upload progress
+pub trait ProgressCallback: Send + Sync {
+    fn on_progress(&self, file_id: &str, bytes_sent: u64, total_bytes: u64);
+    fn on_file_start(&self, file_id: &str, file_name: &str, total_bytes: u64);
+    fn on_file_complete(&self, file_id: &str);
+}
+
+/// A wrapper around AsyncRead that tracks progress
+struct ProgressReader<R> {
+    inner: R,
+    bytes_read: u64,
+    total_bytes: u64,
+    file_id: String,
+    progress_callback: Option<Arc<dyn ProgressCallback>>,
+}
+
+impl<R> ProgressReader<R> {
+    fn new(
+        inner: R,
+        total_bytes: u64,
+        file_id: String,
+        progress_callback: Option<Arc<dyn ProgressCallback>>,
+    ) -> Self {
+        Self {
+            inner,
+            bytes_read: 0,
+            total_bytes,
+            file_id,
+            progress_callback,
+        }
+    }
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ProgressReader<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let result = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        
+        if let std::task::Poll::Ready(Ok(())) = &result {
+            let bytes_read_this_time = buf.filled().len() - before;
+            self.bytes_read += bytes_read_this_time as u64;
+            
+            if let Some(callback) = &self.progress_callback {
+                callback.on_progress(&self.file_id, self.bytes_read, self.total_bytes);
+            }
+        }
+        
+        result
+    }
+}
+
 #[derive(Clone)]
 pub struct Client {
     http_client: ReqwestClient,
     device_info: DeviceInfo,
     is_cancelled: Arc<AtomicBool>,
+    progress_callback: Option<Arc<dyn ProgressCallback>>,
 }
 
 impl Client {
@@ -27,7 +84,13 @@ impl Client {
             http_client,
             device_info,
             is_cancelled: Arc::new(AtomicBool::new(false)),
+            progress_callback: None,
         }
+    }
+
+    pub fn with_progress_callback(mut self, callback: Arc<dyn ProgressCallback>) -> Self {
+        self.progress_callback = Some(callback);
+        self
     }
 
     pub fn cancel(&self) {
@@ -119,12 +182,21 @@ impl Client {
             
             info!("Sending file: {}", path.display());
             
-            // Read file content
-            let file_content = fs::read(path).await
-                .map_err(|e| format!("Failed to read file {}: {}", path.display(), e))?;
+            // Get file info for progress tracking
+            let file_info = files.get(file_id).unwrap();
+            
+            // Notify progress callback that file is starting
+            if let Some(callback) = &self.progress_callback {
+                callback.on_file_start(file_id, &file_info.file_name, file_info.size as u64);
+            }
             
             // Send file with retry logic for connection errors
-            self.send_file_with_retry(&file_url, file_content, path, 3).await?;
+            self.send_file_with_retry(&file_url, path, file_id, 3).await?;
+            
+            // Notify progress callback that file is complete
+            if let Some(callback) = &self.progress_callback {
+                callback.on_file_complete(file_id);
+            }
             
             info!("Successfully sent file: {}", path.display());
         }
@@ -204,22 +276,46 @@ impl Client {
     async fn send_file_with_retry(
         &self,
         url: &str,
-        file_content: Vec<u8>,
         path: &Path,
+        file_id: &str,
         max_retries: u32,
     ) -> Result<(), String> {
+        
         let mut last_error = String::new();
+        let file_size = fs::metadata(path).await
+            .map_err(|e| format!("Failed to get file metadata: {}", e))?
+            .len();
         
         for attempt in 0..=max_retries {
             if self.is_cancelled() {
                 return Err("Operation was cancelled".to_string());
             }
 
+            // Open file for this attempt
+            let file = match fs::File::open(path).await {
+                Ok(f) => f,
+                Err(e) => {
+                    last_error = format!("Failed to open file {}: {}", path.display(), e);
+                    break;
+                }
+            };
+            
+            // Create progress tracking reader
+            let progress_reader = ProgressReader::new(
+                file, 
+                file_size,
+                file_id.to_string(),
+                self.progress_callback.clone()
+            );
+            
+            let stream = ReaderStream::new(progress_reader);
+            let body = reqwest::Body::wrap_stream(stream);
+
             let result = timeout(
                 Duration::from_secs(60), // Longer timeout for file uploads
                 self.http_client
                     .post(url)
-                    .body(file_content.clone())
+                    .body(body)
                     .send()
             ).await;
 

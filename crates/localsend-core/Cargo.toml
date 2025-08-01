@@ -31,4 +31,4 @@ axum = { version = "0.6", features = ["query"] }
 axum-server = { version = "0.4", features = ["tls-rustls"] }
 rustls = "0.20"
 rustls-pemfile = "1.0"
-reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+reqwest = { version = "0.11", features = ["json", "rustls-tls", "stream"] }

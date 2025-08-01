@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Write, io, net::Ipv4Addr, path::PathBuf, time::Duration};
+use std::{collections::HashMap, fmt::Write, io, net::Ipv4Addr, path::PathBuf, time::Duration, sync::Arc};
 
 use console::style;
 use dialoguer::{theme::ColorfulTheme, Input, MultiSelect, Select};
@@ -7,7 +7,7 @@ use tokio::{runtime, sync::mpsc};
 use tracing::{debug, info};
 use tracing_subscriber::{filter::EnvFilter, FmtSubscriber};
 
-use localsend_core::{Client, ClientMessage, DeviceInfo, DeviceScanner, FileInfo, Server, ServerMessage};
+use localsend_core::{Client, ClientMessage, DeviceInfo, DeviceScanner, FileInfo, Server, ServerMessage, ProgressCallback};
 
 const ALIAS: &str = "rustsend";
 const INTERFACE_ADDR: Ipv4Addr = Ipv4Addr::new(0, 0, 0, 0);
@@ -18,6 +18,58 @@ struct State {
     multi_progress: MultiProgress,
     files: HashMap<String, FileInfo>,
     progress_map: HashMap<String, ProgressBar>,
+}
+
+/// Progress callback implementation for file sending
+struct SendProgressCallback {
+    multi_progress: MultiProgress,
+    progress_bars: Arc<std::sync::Mutex<HashMap<String, ProgressBar>>>,
+}
+
+impl SendProgressCallback {
+    fn new() -> Self {
+        Self {
+            multi_progress: MultiProgress::new(),
+            progress_bars: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl ProgressCallback for SendProgressCallback {
+    fn on_file_start(&self, file_id: &str, file_name: &str, total_bytes: u64) {
+        let pb = self.multi_progress.add(ProgressBar::new(total_bytes));
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}"
+            )
+            .unwrap()
+            .with_key("eta", |state: &ProgressState, w: &mut dyn Write| {
+                write!(w, "{:.1}s", state.eta().as_secs_f64()).unwrap()
+            })
+            .progress_chars("#>-")
+        );
+        pb.set_message(format!("Sending {}", file_name));
+        
+        if let Ok(mut bars) = self.progress_bars.lock() {
+            bars.insert(file_id.to_string(), pb);
+        }
+    }
+    
+    fn on_progress(&self, file_id: &str, bytes_sent: u64, _total_bytes: u64) {
+        if let Ok(bars) = self.progress_bars.lock() {
+            if let Some(pb) = bars.get(file_id) {
+                pb.set_position(bytes_sent);
+            }
+        }
+    }
+    
+    fn on_file_complete(&self, file_id: &str) {
+        if let Ok(mut bars) = self.progress_bars.lock() {
+            if let Some(pb) = bars.remove(file_id) {
+                pb.finish_with_message("✓ Complete");
+            }
+        }
+    }
 }
 
 fn main() {
@@ -202,8 +254,13 @@ async fn send_files() -> Result<(), io::Error> {
         port: MULTICAST_PORT,
     };
     
-    // Create client
-    let client = Client::new(device_info);
+    // Create progress callback
+    let progress_callback = Arc::new(SendProgressCallback::new());
+    
+    // Create client with progress callback
+    let client = Client::new(device_info).with_progress_callback(progress_callback.clone());
+    
+    // The progress bars will be displayed automatically by the callback
     
     // TODO: Get discovered devices and let user select one
     // For now, manually input the IP and port
@@ -241,20 +298,20 @@ async fn send_files() -> Result<(), io::Error> {
     
     match client.send_files(&target_device, file_paths.iter().map(PathBuf::as_path).collect()).await {
         Ok(_) => {
-            println!("Files sent successfully!");
+            println!("\n✓ All files sent successfully!");
             cancel_handle.abort(); // Cancel the Ctrl+C handler
         },
         Err(e) => {
             if client.is_cancelled() {
-                println!("File transfer was cancelled by user");
+                println!("\n⚠ File transfer was cancelled by user");
             } else if e.contains("connection reset") || e.contains("network") {
-                println!("Network error occurred: {}", e);
+                println!("\n❌ Network error occurred: {}", e);
                 println!("This could be due to:");
                 println!("  - Network connectivity issues");
                 println!("  - Target device went offline");
                 println!("  - Firewall blocking the connection");
             } else {
-                println!("Error sending files: {}", e);
+                println!("\n❌ Error sending files: {}", e);
             }
             cancel_handle.abort();
         },

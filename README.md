@@ -23,6 +23,7 @@ a small todo: `use mem::take` when ever possible, to avoid clones.
 - [x] **Connection reset error handling with automatic retries**
 - [x] **Request cancellation support (Ctrl+C)**
 - [x] **Robust network error recovery**
+- [x] **Real-time progress tracking for file transfers**
 - [ ] GUI interface (planned)
 - [ ] Mobile app support (planned)
 
@@ -45,12 +46,18 @@ The application now includes robust error handling for network issues:
 - **Stream error recovery**: File receiving handles stream errors with retry logic
 - **Progress tracking**: Failed transfers report how much data was successfully transferred
 
+### Progress Tracking
+- **Real-time progress bars**: Visual progress indicators show transfer status for each file
+- **Transfer speed and ETA**: Display current transfer speed and estimated time remaining
+- **File-by-file tracking**: Individual progress bars for each file being sent
+- **Completion status**: Clear visual indicators when files are successfully transferred
+
 ## Roadmap
 
 - [x] receive files
 - [x] send files
 - [x] handle connection reset errors and cancel requests when sending and receiving files
-- [ ] progress for sending files
+- [x] progress for sending files
 - [x] pass config from bin to lib
 - [ ] config file for device name, default port, etc
 - [ ] Support protocol `v2`
